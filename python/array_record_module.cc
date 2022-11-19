@@ -46,15 +46,19 @@ PYBIND11_MODULE(array_record_module, m) {
                throw py::value_error(
                    std::string(status_or_option.status().message()));
              }
-             auto file_writer = std::make_unique<riegeli::FdWriter<>>(path);
+             std::unique_ptr<riegeli::FdWriter<>> file_writer;
+             {
+               py::gil_scoped_release scoped_release;
+               file_writer = std::make_unique<riegeli::FdWriter<>>(path);
+             }
 
              if (!file_writer->ok()) {
                throw std::runtime_error(
                    std::string(file_writer->status().message()));
              }
-             return array_record::ArrayRecordWriter<
-                 std::unique_ptr<riegeli::Writer>>(std::move(file_writer),
-                                                   status_or_option.value());
+             py::gil_scoped_release scoped_release;
+             return ArrayRecordWriter(std::move(file_writer),
+                                      status_or_option.value());
            }),
            py::arg("path"), py::arg("options") = "")
       .def("ok", &ArrayRecordWriter::ok)
@@ -75,8 +79,7 @@ PYBIND11_MODULE(array_record_module, m) {
         }
       });
 
-  py::class_<array_record::ArrayRecordReader<std::unique_ptr<riegeli::Reader>>>(
-      m, "ArrayRecordReader")
+  py::class_<ArrayRecordReader>(m, "ArrayRecordReader")
       .def(py::init([](const std::string& path, const std::string& options) {
              auto status_or_option =
                  array_record::ArrayRecordReaderBase::Options::FromString(
@@ -85,15 +88,19 @@ PYBIND11_MODULE(array_record_module, m) {
                throw py::value_error(
                    std::string(status_or_option.status().message()));
              }
-             auto file_reader = std::make_unique<riegeli::FdReader<>>(path);
+             std::unique_ptr<riegeli::FdReader<>> file_reader;
+             {
+               py::gil_scoped_release scoped_release;
+               file_reader = std::make_unique<riegeli::FdReader<>>(path);
+             }
              if (!file_reader->ok()) {
                throw std::runtime_error(
                    std::string(file_reader->status().message()));
              }
-             return array_record::ArrayRecordReader<
-                 std::unique_ptr<riegeli::Reader>>(
-                 std::move(file_reader), status_or_option.value(),
-                 array_record::ArrayRecordGlobalPool());
+             py::gil_scoped_release scoped_release;
+             return ArrayRecordReader(std::move(file_reader),
+                                      status_or_option.value(),
+                                      array_record::ArrayRecordGlobalPool());
            }),
            py::arg("path"), py::arg("options") = "")
       .def("ok", &ArrayRecordReader::ok)
@@ -106,6 +113,7 @@ PYBIND11_MODULE(array_record_module, m) {
       .def("is_open", &ArrayRecordReader::is_open)
       .def("num_records", &ArrayRecordReader::NumRecords)
       .def("record_index", &ArrayRecordReader::RecordIndex)
+      .def("writer_options_string", &ArrayRecordReader::WriterOptionsString)
       .def("seek",
            [](ArrayRecordReader& reader, int64_t record_index) {
              if (!reader.SeekRecord(record_index)) {
@@ -125,37 +133,91 @@ PYBIND11_MODULE(array_record_module, m) {
              }
              return py::bytes(string_view);
            })
-      .def(
-          "read",
-          [](ArrayRecordReader& reader, std::vector<uint64_t> indices) {
-            std::vector<py::bytes> output(indices.size());
-            auto status = reader.ParallelReadRecordsWithIndices(
-                indices,
-                [&](uint64_t indices_index,
-                    absl::string_view record_data) -> absl::Status {
-                  output[indices_index] = record_data;
-                  return absl::OkStatus();
-                });
-            if (!status.ok()) {
-              throw std::runtime_error(std::string(status.message()));
-            }
-            return output;
-          },
-          py::call_guard<py::gil_scoped_release>())
-      .def(
-          "read_all",
-          [](ArrayRecordReader& reader) {
-            std::vector<py::bytes> output(reader.NumRecords());
-            auto status = reader.ParallelReadRecords(
-                [&](uint64_t index,
-                    absl::string_view record_data) -> absl::Status {
-                  output[index] = record_data;
-                  return absl::OkStatus();
-                });
-            if (!status.ok()) {
-              throw std::runtime_error(std::string(status.message()));
-            }
-            return output;
-          },
-          py::call_guard<py::gil_scoped_release>());
+      .def("read",
+           [](ArrayRecordReader& reader, std::vector<uint64_t> indices) {
+             std::vector<std::string> staging(indices.size());
+             py::list output(indices.size());
+             {
+               py::gil_scoped_release scoped_release;
+               auto status = reader.ParallelReadRecordsWithIndices(
+                   indices,
+                   [&](uint64_t indices_index,
+                       absl::string_view record_data) -> absl::Status {
+                     staging[indices_index] = record_data;
+                     return absl::OkStatus();
+                   });
+               if (!status.ok()) {
+                 throw std::runtime_error(std::string(status.message()));
+               }
+             }
+             ssize_t index = 0;
+             for (const auto& record : staging) {
+               auto py_record = py::bytes(record);
+               PyList_SET_ITEM(output.ptr(), index++,
+                               py_record.release().ptr());
+             }
+             return output;
+           })
+      .def("read",
+           [](ArrayRecordReader& reader, int32_t begin, int32_t end) {
+             int32_t range_begin = begin, range_end = end;
+             if (range_begin < 0) {
+               range_begin = reader.NumRecords() + range_begin;
+             }
+             if (range_end < 0) {
+               range_end = reader.NumRecords() + range_end;
+             }
+             if (range_begin > reader.NumRecords() || range_begin < 0 ||
+                 range_end > reader.NumRecords() || range_end < 0 ||
+                 range_end <= range_begin) {
+               throw std::out_of_range(
+                   absl::StrFormat("[%d, %d) is of range of [0, %d)", begin,
+                                   end, reader.NumRecords()));
+             }
+             int32_t num_to_read = range_end - range_begin;
+             std::vector<std::string> staging(num_to_read);
+             py::list output(num_to_read);
+             {
+               py::gil_scoped_release scoped_release;
+               auto status = reader.ParallelReadRecordsInRange(
+                   range_begin, range_end,
+                   [&](uint64_t index,
+                       absl::string_view record_data) -> absl::Status {
+                     staging[index - range_begin] = record_data;
+                     return absl::OkStatus();
+                   });
+               if (!status.ok()) {
+                 throw std::runtime_error(std::string(status.message()));
+               }
+             }
+             ssize_t index = 0;
+             for (const auto& record : staging) {
+               auto py_record = py::bytes(record);
+               PyList_SET_ITEM(output.ptr(), index++,
+                               py_record.release().ptr());
+             }
+             return output;
+           })
+      .def("read_all", [](ArrayRecordReader& reader) {
+        std::vector<std::string> staging(reader.NumRecords());
+        py::list output(reader.NumRecords());
+        {
+          py::gil_scoped_release scoped_release;
+          auto status = reader.ParallelReadRecords(
+              [&](uint64_t index,
+                  absl::string_view record_data) -> absl::Status {
+                staging[index] = record_data;
+                return absl::OkStatus();
+              });
+          if (!status.ok()) {
+            throw std::runtime_error(std::string(status.message()));
+          }
+        }
+        ssize_t index = 0;
+        for (const auto& record : staging) {
+          auto py_record = py::bytes(record);
+          PyList_SET_ITEM(output.ptr(), index++, py_record.release().ptr());
+        }
+        return output;
+      });
 }
