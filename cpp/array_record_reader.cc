@@ -71,6 +71,11 @@ using riegeli::OptionsParser;
 using riegeli::Reader;
 using riegeli::ValueParser;
 
+template <class T>
+T CeilOfRatio(T x, T d) {
+  return (x + d - 1) / d;
+}
+
 absl::StatusOr<ArrayRecordReaderBase::Options>
 ArrayRecordReaderBase::Options::FromString(absl::string_view text) {
   ArrayRecordReaderBase::Options options;
@@ -119,6 +124,9 @@ struct ArrayRecordReaderBase::ArrayRecordReaderState {
   std::vector<ChunkDecoder> current_decoders;
   std::queue<IndexedPair<std::future<std::vector<ChunkDecoder>>>>
       future_decoders;
+
+  // Writer options for debugging purposes.
+  std::optional<std::string> writer_options = std::nullopt;
 
   uint64_t ChunkEndOffset(uint64_t chunk_idx) const {
     if (chunk_idx == footer.size() - 1) {
@@ -258,6 +266,10 @@ void ArrayRecordReaderBase::Initialize() {
       return;
     }
     state_->num_records = footer_metadata.array_record_metadata().num_records();
+    if (footer_metadata.array_record_metadata().has_writer_options()) {
+      state_->writer_options =
+          footer_metadata.array_record_metadata().writer_options();
+    }
   }
   {
     AR_ENDO_SCOPE("Reading footer body");
@@ -300,7 +312,8 @@ absl::Status ArrayRecordReaderBase::ParallelReadRecords(
   if (state_->footer.empty()) {
     return absl::OkStatus();
   }
-  uint64_t num_chunk_groups = state_->footer.size() / state_->chunk_group_size;
+  uint64_t num_chunk_groups =
+      CeilOfRatio(state_->footer.size(), state_->chunk_group_size);
   const auto reader = get_backing_reader();
   Reader* mutable_reader = const_cast<Reader*>(
       reinterpret_cast<const Reader*>(reader.get()));
@@ -308,7 +321,9 @@ absl::Status ArrayRecordReaderBase::ParallelReadRecords(
       Seq(num_chunk_groups), state_->pool, [&](size_t buf_idx) -> absl::Status {
         uint64_t chunk_idx_start = buf_idx * state_->chunk_group_size;
         // inclusive index, not the conventional exclusive index.
-        uint64_t last_chunk_idx = (buf_idx + 1) * state_->chunk_group_size - 1;
+        uint64_t last_chunk_idx =
+            std::min((buf_idx + 1) * state_->chunk_group_size - 1,
+                     state_->footer.size() - 1);
         uint64_t buf_len = state_->ChunkEndOffset(last_chunk_idx) -
                            state_->footer[chunk_idx_start].chunk_offset();
         AR_ENDO_JOB(
@@ -343,6 +358,96 @@ absl::Status ArrayRecordReaderBase::ParallelReadRecords(
               return decoder.status();
             }
             auto s = callback(record_index_base + inner_record_idx, record);
+            if (ABSL_PREDICT_FALSE(!s.ok())) {
+              return s;
+            }
+          }
+          if (ABSL_PREDICT_FALSE(!decoder.Close())) {
+            return decoder.status();
+          }
+          if (ABSL_PREDICT_FALSE(!chunk_reader.Close())) {
+            return chunk_reader.status();
+          }
+        }
+        return absl::OkStatus();
+      });
+  return status;
+}
+
+absl::Status ArrayRecordReaderBase::ParallelReadRecordsInRange(
+    uint64_t begin, uint64_t end,
+    absl::FunctionRef<absl::Status(uint64_t, absl::string_view)> callback)
+    const {
+  if (!ok()) {
+    return status();
+  }
+  if (state_->footer.empty()) {
+    return absl::OkStatus();
+  }
+  if (end > NumRecords() || begin >= end) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Invalid range [%d, %d). Total records: %d", begin, end, NumRecords()));
+  }
+  uint64_t chunk_idx_begin = begin / state_->record_group_size;
+  uint64_t chunk_idx_end = CeilOfRatio(end, state_->record_group_size);
+  uint64_t num_chunks = chunk_idx_end - chunk_idx_begin;
+  uint64_t num_chunk_groups = CeilOfRatio(num_chunks, state_->chunk_group_size);
+
+  const auto reader = get_backing_reader();
+  Reader* mutable_reader =
+      const_cast<Reader*>(reinterpret_cast<const Reader*>(reader.get()));
+  auto status = ParallelForWithStatus<1>(
+      Seq(num_chunk_groups), state_->pool, [&](size_t buf_idx) -> absl::Status {
+        uint64_t chunk_idx_start =
+            chunk_idx_begin + buf_idx * state_->chunk_group_size;
+        // inclusive index, not the conventional exclusive index.
+        uint64_t last_chunk_idx = std::min(
+            chunk_idx_begin + (buf_idx + 1) * state_->chunk_group_size - 1,
+            chunk_idx_end - 1);
+        uint64_t buf_len = state_->ChunkEndOffset(last_chunk_idx) -
+                           state_->footer[chunk_idx_start].chunk_offset();
+        AR_ENDO_JOB(
+            "ArrayRecordReaderBase::ParallelReadRecordsWithRange",
+            absl::StrCat("buffer_idx: ", buf_idx, " buffer_len: ", buf_len));
+
+        MaskedReader masked_reader(riegeli::kClosed);
+        {
+          AR_ENDO_SCOPE("MaskedReader");
+          masked_reader =
+              MaskedReader(mutable_reader->NewReader(
+                               state_->footer[chunk_idx_start].chunk_offset()),
+                           buf_len);
+        }
+        for (uint64_t chunk_idx = chunk_idx_start; chunk_idx <= last_chunk_idx;
+             ++chunk_idx) {
+          AR_ENDO_SCOPE("ChunkReader+ChunkDecoder");
+          masked_reader.Seek(state_->footer[chunk_idx].chunk_offset());
+          riegeli::DefaultChunkReader<> chunk_reader(&masked_reader);
+          Chunk chunk;
+          if (ABSL_PREDICT_FALSE(!chunk_reader.ReadChunk(chunk))) {
+            return chunk_reader.status();
+          }
+          ChunkDecoder decoder;
+          if (ABSL_PREDICT_FALSE(!decoder.Decode(chunk))) {
+            return decoder.status();
+          }
+          uint64_t record_index_base = chunk_idx * state_->record_group_size;
+          uint64_t inner_record_idx_start = 0;
+          if (record_index_base < begin) {
+            decoder.SetIndex(begin - record_index_base);
+            inner_record_idx_start = begin - record_index_base;
+          }
+          for (auto inner_record_idx :
+               Seq(inner_record_idx_start, decoder.num_records())) {
+            uint64_t record_idx = record_index_base + inner_record_idx;
+            if (ABSL_PREDICT_FALSE(record_idx >= end)) {
+              break;
+            }
+            absl::string_view record;
+            if (ABSL_PREDICT_FALSE(!decoder.ReadRecord(record))) {
+              return decoder.status();
+            }
+            auto s = callback(record_idx, record);
             if (ABSL_PREDICT_FALSE(!s.ok())) {
               return s;
             }
@@ -572,7 +677,7 @@ bool ArrayRecordReaderBase::ReadAheadFromBuffer(uint64_t buffer_idx) {
     if (buffer_to_add * state_->chunk_group_size >= state_->footer.size()) {
       break;
     }
-    // Although our internal ThreadPool takes gtl::AnyInvocable which is
+    // Although our internal ThreadPool takes absl::AnyInvocable which is
     // movable, OSS ThreadPool only takes std::function which requires all the
     // captures to be copyable. Therefore we must wrap the promise in a
     // shared_ptr to copy it over to the scheduled task.
@@ -657,6 +762,10 @@ bool ArrayRecordReaderBase::ReadAheadFromBuffer(uint64_t buffer_idx) {
   }
 
   return true;
+}
+
+std::optional<std::string> ArrayRecordReaderBase::WriterOptionsString() const {
+  return state_->writer_options;
 }
 
 }  // namespace array_record

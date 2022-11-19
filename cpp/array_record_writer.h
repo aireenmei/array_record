@@ -69,7 +69,6 @@ limitations under the License.
 #include "cpp/common.h"
 #include "cpp/sequenced_chunk_writer.h"
 #include "cpp/thread_pool.h"
-#include "riegeli/base/base.h"
 #include "riegeli/base/object.h"
 #include "riegeli/chunk_encoding/chunk.h"
 #include "riegeli/chunk_encoding/chunk_encoder.h"
@@ -83,7 +82,7 @@ class ArrayRecordWriterBase : public riegeli::Object {
  public:
   class Options {
    public:
-    Options() {}
+    Options();
 
     // Parses options from text:
     // ```
@@ -267,6 +266,9 @@ class ArrayRecordWriterBase : public riegeli::Object {
     std::optional<riegeli::RecordsMetadata> metadata() const {
       return metadata_;
     }
+
+    // Serialize the options to a string.
+    std::string ToString() const;
 
    private:
     int32_t group_size_ = kDefaultGroupSize;
